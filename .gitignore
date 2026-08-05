@@ -1,0 +1,10 @@
+# runtime state — never versioned
+queue.db
+queue.db-wal
+queue.db-shm
+daemon.pid
+daemon*.log
+fpga.lock
+jobs/
+*.bak.*
+__pycache__/
