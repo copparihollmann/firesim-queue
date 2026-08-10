@@ -1062,6 +1062,20 @@ def _run_one_job_bash(conn: sqlite3.Connection, job: dict) -> int:
     env = json.loads(job["env_json"])
     final_env = dict(os.environ)
     final_env.update(env)
+    # OPTION A: run the job AS THE SUBMITTER. The daemon runs as root and drops
+    # privileges (setgid -> initgroups -> setuid) to the submitting user via the
+    # preexec_fn below, so the job executes with the submitter's uid, HOME, ssh
+    # keys, caches, and file access -- eliminating cross-user permission issues.
+    import pwd as _pwd
+    _upw = _pwd.getpwnam(job["user"])
+    final_env["HOME"] = _upw.pw_dir
+    final_env["USER"] = _upw.pw_name
+    final_env["LOGNAME"] = _upw.pw_name
+    _uid, _gid, _uname = _upw.pw_uid, _upw.pw_gid, _upw.pw_name
+    def _job_preexec():
+        os.setgid(_gid)
+        os.initgroups(_uname, _gid)
+        os.setuid(_uid)
 
     started = time.time()
     conn.execute(
@@ -1085,7 +1099,7 @@ def _run_one_job_bash(conn: sqlite3.Connection, job: dict) -> int:
                     ["bash", str(workdir / "cmd.sh")],
                     cwd=job["cwd"], env=final_env,
                     stdout=so, stderr=se,
-                    start_new_session=True)
+                    preexec_fn=_job_preexec, start_new_session=True)
                 conn.execute("UPDATE jobs SET pid=? WHERE id=?",
                              (proc.pid, job["id"]))
                 # Watch loop: heartbeat + check for owner-requested cancel.
@@ -1274,6 +1288,20 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
     env = json.loads(job["env_json"])
     final_env = dict(os.environ)
     final_env.update(env)
+    # OPTION A: run the job AS THE SUBMITTER. The daemon runs as root and drops
+    # privileges (setgid -> initgroups -> setuid) to the submitting user via the
+    # preexec_fn below, so the job executes with the submitter's uid, HOME, ssh
+    # keys, caches, and file access -- eliminating cross-user permission issues.
+    import pwd as _pwd
+    _upw = _pwd.getpwnam(job["user"])
+    final_env["HOME"] = _upw.pw_dir
+    final_env["USER"] = _upw.pw_name
+    final_env["LOGNAME"] = _upw.pw_name
+    _uid, _gid, _uname = _upw.pw_uid, _upw.pw_gid, _upw.pw_name
+    def _job_preexec():
+        os.setgid(_gid)
+        os.initgroups(_uname, _gid)
+        os.setuid(_uid)
 
     started = time.time()
     conn.execute(
@@ -1338,7 +1366,7 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
         deadline = (time.time() + wall_timeout) if wall_timeout else None
         proc = subprocess.Popen(
             argv, cwd=str(deploy), env=final_env,
-            stdout=so, stderr=se, start_new_session=True)
+            stdout=so, stderr=se, preexec_fn=_job_preexec, start_new_session=True)
         conn.execute("UPDATE jobs SET pid=? WHERE id=?", (proc.pid, job_id))
         while True:
             rc = proc.poll()
@@ -1422,7 +1450,7 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
                 # Wrap in `|| true` so a failed kill (nothing to kill)
                 # doesn't trip our `set -e`. We do that by calling
                 # bash with a sub-pipe.
-                subprocess.run(kill_argv, cwd=str(deploy), env=final_env,
+                subprocess.run(kill_argv, cwd=str(deploy), env=final_env, preexec_fn=_job_preexec,
                                stdout=so, stderr=se, check=False)
                 infra_argv = _firesim_cmd("infrasetup")
                 rc_infra, hint_infra = _run_phase(
@@ -1463,7 +1491,7 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
                 _set_phase(conn, job_id, "TEARDOWN")
                 _write_banner("TEARDOWN")
                 kill_argv = _firesim_cmd("kill")
-                subprocess.run(kill_argv, cwd=str(deploy), env=final_env,
+                subprocess.run(kill_argv, cwd=str(deploy), env=final_env, preexec_fn=_job_preexec,
                                stdout=so, stderr=se, check=False)
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     finally:
