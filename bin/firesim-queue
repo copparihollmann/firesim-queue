@@ -1,4 +1,4 @@
 #!/bin/bash
 # Thin shim so users can call `firesim-queue` directly. The actual logic
 # lives in firesim_queue.py next to this file.
-exec python3 "$(dirname "$(readlink -f "$0")")/firesim_queue.py" "$@"
+exec python3 -I "$(dirname "$(readlink -f "$0")")/firesim_queue.py" "$@"

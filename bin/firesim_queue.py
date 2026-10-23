@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """firesim-queue — single-FPGA job queue with per-user fair share.
 
-Architecture (see $FIRESIM_QUEUE_ROOT/README.md):
+Architecture (see README.md):
   - SQLite-backed job table at $FIRESIM_QUEUE_ROOT/queue.db
   - One daemon process holds the FPGA flock and dispatches jobs
   - Clients call `submit` which inserts a row and polls until done
@@ -24,9 +24,12 @@ import argparse
 import contextlib
 import fcntl
 import getpass
+import grp
+import hashlib
 import json
 import os
 import pathlib
+import pwd
 import shlex
 import shutil
 import signal
@@ -44,10 +47,169 @@ DAEMON_PID = QUEUE_ROOT / "daemon.pid"
 DAEMON_LOG = QUEUE_ROOT / "daemon.log"
 FPGA_LOCK = QUEUE_ROOT / "fpga.lock"
 JOBS_DIR = QUEUE_ROOT / "jobs"
+_runtime_root = pathlib.Path(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.geteuid()}")
+)
+if not _runtime_root.is_dir():
+    _runtime_root = pathlib.Path("/tmp")
+_queue_identity = hashlib.sha256(str(QUEUE_ROOT.resolve()).encode()).hexdigest()[:16]
+HWDB_SNAPSHOT_ROOT = pathlib.Path(
+    os.environ.get(
+        "FIRESIM_QUEUE_HWDB_SNAPSHOT_ROOT",
+        str(_runtime_root / f"firesim-queue-hwdb-{_queue_identity}"),
+    )
+)
 HEARTBEAT_KEY = "daemon_heartbeat"
 DAEMON_STALE_SECONDS = 300        # if heartbeat older than this, daemon is dead
 POLL_INTERVAL_SECONDS = 5
 HEARTBEAT_INTERVAL_SECONDS = 30
+# Control-plane operations normally complete in tens of seconds, but Fabric can
+# wedge while killing a stale local simulator.  These phases must be bounded
+# independently of the user workload timeout: a stuck leading/trailing kill
+# otherwise blocks the shared FPGA queue forever, and cancellation cannot be
+# observed while subprocess.run() is waiting.
+FIRESIM_KILL_TIMEOUT_SECONDS = 90
+FIRESIM_INFRASETUP_TIMEOUT_SECONDS = 900
+
+
+# ---------------------------------------------------------------------------
+# Shared-filesystem helpers
+# ---------------------------------------------------------------------------
+# Queue artifacts are created by whoever ran the command but written by
+# whoever runs the daemon, and those are different people. Without a common
+# group the daemon cannot write a submitter's job dir at all, so it skips the
+# job forever (see the PermissionError arm of _daemon_loop) and the submitter
+# watches their job sit QUEUED behind nothing. SHARED_GROUP is the group every
+# queue user belongs to; job dirs are created setgid to it so write access is
+# inherited no matter who submitted.
+SHARED_GROUP = os.environ.get("FIRESIM_QUEUE_GROUP", "firesim")
+ADMIN_GROUP = "firesim-admins"
+SHARED_DIR_MODE = 0o2775          # setgid: children inherit SHARED_GROUP
+
+
+def _shared_gid() -> int | None:
+    """gid of SHARED_GROUP, or None if it doesn't exist on this host."""
+    try:
+        return grp.getgrnam(SHARED_GROUP).gr_gid
+    except KeyError:
+        return None
+
+
+def _share_dir(path: pathlib.Path) -> None:
+    """Make `path` group-writable and setgid, so the daemon can write it
+    whoever submitted. Best-effort throughout: chgrp fails when we neither own
+    the dir nor belong to the group, and neither is worth failing a submit
+    over -- the daemon degrades to skipping the job, exactly as before."""
+    gid = _shared_gid()
+    try:
+        if gid is not None and path.stat().st_gid != gid:
+            os.chown(path, -1, gid)
+    except OSError:
+        pass
+    try:
+        path.chmod(SHARED_DIR_MODE)
+    except OSError:
+        pass
+
+
+def _require_shared_group() -> None:
+    """Refuse a submit from someone outside SHARED_GROUP, with instructions.
+
+    This failure is silent by nature and costs days: a submitter outside the
+    group creates a job dir the daemon cannot write, the daemon skips the job
+    for its whole lifetime, and the submitter watches their job sit QUEUED
+    behind an *empty* queue -- which reads as "someone is hogging the FPGA"
+    rather than "you are not in a unix group". Refusing up front, naming the
+    exact fix, is worth more than accepting a job we know will never run.
+    """
+    gid = _shared_gid()
+    if gid is None:
+        return                      # group not provisioned here; nothing to enforce
+    if os.geteuid() == 0 or gid in os.getgroups():
+        return
+    who = os.environ.get("USER") or str(os.geteuid())
+    print(
+        f"error: {who} is not in the '{SHARED_GROUP}' group, so the queue daemon\n"
+        f"       could not run this job -- it would sit QUEUED forever.\n"
+        f"\n"
+        f"       Fix (needs an admin):  sudo usermod -aG {SHARED_GROUP} {who}\n"
+        f"       Then start a new login shell so the group takes effect.\n",
+        file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _is_queue_admin(uid: int) -> bool:
+    """Return whether *uid* may perform queue-wide administrative actions.
+
+    Root is always an administrator. Human queue administrators are taken
+    from the fixed host-level ``firesim-admins`` group. This group name is not
+    configurable through the caller's environment: otherwise a user could
+    point it at one of their own groups and authorize their own force-cancel.
+    """
+    if uid == 0:
+        return True
+    try:
+        account = pwd.getpwuid(uid)
+        admin_group = grp.getgrnam(ADMIN_GROUP)
+    except KeyError:
+        return False
+    return (account.pw_gid == admin_group.gr_gid
+            or account.pw_name in admin_group.gr_mem)
+
+
+def _hwdb_snapshot_parent_is_protected(*, owner_uid: int, mode: int) -> bool:
+    """Whether a parent cannot be made replaceable by an untrusted owner."""
+    trusted_owner = owner_uid in {0, os.geteuid()}
+    daemon_private = owner_uid == os.geteuid() and mode & 0o077 == 0
+    trusted_sticky = trusted_owner and bool(mode & 0o1000)
+    trusted_not_writable = trusted_owner and mode & 0o022 == 0
+    return daemon_private or trusted_sticky or trusted_not_writable
+
+
+def _prepare_hwdb_snapshot_root() -> pathlib.Path:
+    """Return a daemon-owned directory other queue users cannot replace.
+
+    Job directories must be group-writable so a daemon can serve submissions
+    from other users.  A read-only file directly beneath such a directory is
+    not immutable: a group member can unlink or rename it.  Snapshot files
+    therefore live beneath the daemon's private runtime directory.  The
+    runtime parent is either the daemon-owned XDG runtime directory or /tmp
+    (whose sticky bit prevents another uid from renaming our child).
+    """
+    root = HWDB_SNAPSHOT_ROOT.resolve()
+    parent = root.parent
+    try:
+        parent_stat = parent.stat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot stat HWDB snapshot parent {parent}: {exc}") from exc
+    parent_mode = parent_stat.st_mode & 0o7777
+    if not _hwdb_snapshot_parent_is_protected(
+        owner_uid=parent_stat.st_uid, mode=parent_mode
+    ):
+        raise RuntimeError(
+            f"HWDB snapshot parent is replaceable by another uid: {parent}")
+    try:
+        root.mkdir(mode=0o700, parents=False, exist_ok=True)
+        root_stat = root.stat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot prepare daemon-private HWDB snapshot root {root}: {exc}"
+        ) from exc
+    if not root.is_dir() or root.is_symlink():
+        raise RuntimeError(f"HWDB snapshot root is not a real directory: {root}")
+    if root_stat.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"HWDB snapshot root is not owned by daemon uid {os.geteuid()}: {root}"
+        )
+    try:
+        root.chmod(0o700)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot protect HWDB snapshot root {root}: {exc}") from exc
+    if root.stat().st_mode & 0o077:
+        raise RuntimeError(f"HWDB snapshot root is not private: {root}")
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +249,10 @@ CREATE TABLE IF NOT EXISTS kv (
 def _connect() -> sqlite3.Connection:
     QUEUE_ROOT.mkdir(parents=True, exist_ok=True)
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    # Self-healing: a queue root deployed before SHARED_GROUP existed gets
+    # fixed on the next command anyone runs.
+    _share_dir(QUEUE_ROOT)
+    _share_dir(JOBS_DIR)
     conn = sqlite3.connect(str(DB_PATH), timeout=30.0,
                            isolation_level=None)  # autocommit; explicit BEGIN
     conn.execute("PRAGMA journal_mode=WAL")
@@ -494,6 +660,7 @@ def _daemon_pid_alive() -> int | None:
 # ---------------------------------------------------------------------------
 
 def cmd_submit(args: argparse.Namespace) -> int:
+    _require_shared_group()
     conn = _connect()
     alive, age = _daemon_alive(conn)
     if not alive:
@@ -531,6 +698,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     job_id = cur.lastrowid
     workdir = JOBS_DIR / str(job_id)
     workdir.mkdir(parents=True, exist_ok=True)
+    _share_dir(workdir)
     (workdir / "cmd.sh").write_text(
         f"#!/bin/bash\n# job_id={job_id} user={user} priority={args.priority}"
         f" project={project}\n"
@@ -631,7 +799,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 # infrasetup'd state without releasing it (agent crash, OOM, forgotten
 # kill), and races on shared state (deploy/config_runtime.yaml is
 # rewritten by infrasetup — concurrent users overwrote each other's
-# workload name, ending up running merlin's workload on agustin's
+# workload name, ending up running one user's workload on another user's
 # submission). The atomic op removes both problems by construction:
 #
 #   1. Daemon owns every firesim CLI invocation, so the FPGA lock is
@@ -648,7 +816,284 @@ def cmd_submit(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+# Optional exact file handoff. Installed by the queue operator, never selected
+# through a submitter import string or PYTHONPATH. The standalone helper is
+# source-byte pinned; no package import or runtime authority is implied.
+PINNED_FILES_SOURCE_SHA256 = "081a7014eeff604cda30570fff61329f09484f63a35ba33fa2f1662772bd644e"
+_PINNED_FILE_API = None
+
+
+def _pinned_file_api():
+    global _PINNED_FILE_API
+    import types
+
+    path = pathlib.Path(__file__).resolve().with_name("pinned_files.py")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != PINNED_FILES_SOURCE_SHA256:
+        raise RuntimeError("installed pinned-file helper source changed")
+    if _PINNED_FILE_API is not None:
+        return _PINNED_FILE_API
+    name = "_firesim_queue_reviewed_pinned_files"
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    sys.modules[name] = module
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    _PINNED_FILE_API = module
+    return module
+
+
+def _relative_input_name(value):
+    if (
+        type(value) is not str
+        or not value
+        or "\\" in value
+        or value.startswith("/")
+        or any(x in ("", ".", "..") for x in value.split("/"))
+    ):
+        raise RuntimeError("input membership requires a normalized relative path")
+    return value
+
+
+def _local_input_path(value):
+    from urllib.parse import urlsplit, unquote
+
+    if type(value) is not str:
+        raise RuntimeError("HWDB input URI must be a string")
+    if value.startswith("file:"):
+        uri = urlsplit(value)
+        if uri.scheme != "file" or uri.netloc or uri.query or uri.fragment:
+            raise RuntimeError("only explicit local HWDB input URIs are supported")
+        value = unquote(uri.path)
+    path = pathlib.Path(value)
+    if not path.is_absolute() or path.resolve() != path or path.is_symlink():
+        raise RuntimeError("input source must be an explicit canonical local file")
+    return path
+
+
+def _committed_hwdb(raw, hw_config):
+    import yaml
+
+    # Aliases and duplicate keys make exact URI membership ambiguous.
+    if any(isinstance(event, yaml.events.AliasEvent) for event in yaml.parse(raw)):
+        raise RuntimeError("HWDB aliases are unsupported for committed inputs")
+
+    class UniqueLoader(yaml.SafeLoader):
+        pass
+
+    def unique_mapping(loader, node, deep=False):
+        result = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if type(key) is not str or key in result:
+                raise RuntimeError("HWDB contains duplicate or non-string keys")
+            result[key] = loader.construct_object(value_node, deep=deep)
+        return result
+
+    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+    body = yaml.load(raw, Loader=UniqueLoader)
+    if type(body) is not dict or set(body) != {hw_config} or type(body[hw_config]) is not dict:
+        raise RuntimeError("committed inputs require the exact one-entry HWDB")
+    return body
+
+
+def _committed_declaration(files, slots, uris, *, stage_from, bootbinary, hw_config, hwdb_raw):
+    if not files and not slots and not uris:
+        return None
+    api = _pinned_file_api()
+    if not files or not slots or not uris or not stage_from or not hw_config:
+        raise RuntimeError("committed input, slot, URI, ELF and HWDB memberships are required")
+    _relative_input_name(bootbinary)
+    if "/" in bootbinary:
+        raise RuntimeError("staged ELF name must be a basename")
+    pins = tuple(api.PinnedFile(_local_input_path(path), digest) for path, digest in files)
+    api.verify_files(pins)
+    staged = _local_input_path(stage_from)
+    if staged not in {item.path for item in pins}:
+        raise RuntimeError("staged ELF is absent from committed input membership")
+    checked_slots = []
+    for directory, elf_name in slots:
+        checked_slots.append([_relative_input_name(directory), _relative_input_name(elf_name)])
+        if "/" in elf_name:
+            raise RuntimeError("slot ELF name must be a basename")
+    if len({x[0] for x in checked_slots}) != len(checked_slots):
+        raise RuntimeError("consumed slot membership repeats a directory")
+    body = _committed_hwdb(hwdb_raw, hw_config)[hw_config]
+    checked_uris = []
+    paths = {staged}
+    for field, uri, archive_name in uris:
+        if field not in ("bitstream_tar", "driver_tar") or body.get(field) != uri:
+            raise RuntimeError("HWDB URI does not match its exact declared field")
+        path = _local_input_path(uri)
+        _relative_input_name(archive_name)
+        if "/" in archive_name or path == staged:
+            raise RuntimeError("archive membership must be distinct from the staged ELF")
+        paths.add(path)
+        checked_uris.append([field, uri, archive_name])
+    if (
+        len({x[0] for x in checked_uris}) != len(checked_uris)
+        or len({x[2] for x in checked_uris}) != len(checked_uris)
+        or len(paths) != len(checked_uris) + 1
+        or paths != {item.path for item in pins}
+        or {x[0] for x in checked_uris} != {"bitstream_tar", "driver_tar"}
+    ):
+        raise RuntimeError("ELF and both local HWDB archive memberships must be exact and unique")
+    return {"files": [[str(x.path), x.sha256] for x in pins], "slots": checked_slots, "uris": checked_uris}
+
+
+def _archive_members(path):
+    import tarfile
+
+    result = {}
+    with tarfile.open(path, "r:*") as archive:
+        seen = set()
+        for member in archive:
+            name = member.name
+            while name.startswith("./"):
+                name = name[2:]
+            if name in ("", ".") and member.isdir():
+                continue
+            name = _relative_input_name(name.rstrip("/") if member.isdir() else name)
+            if name in seen or not (member.isdir() or member.isfile()):
+                raise RuntimeError("archive links, special files and repeated members are unsupported")
+            seen.add(name)
+            if member.isfile():
+                digest = hashlib.sha256()
+                source = archive.extractfile(member)
+                if source is None:
+                    raise RuntimeError("archive regular member cannot be reopened")
+                with source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                result[name] = digest.hexdigest()
+    if not result:
+        raise RuntimeError("archive has no complete regular-file membership")
+    return result
+
+
+def _private_committed_inputs(selection, snapshot_root, job_id, original_hwdb, hw_config, stage_from):
+    import yaml
+
+    api = _pinned_file_api()
+    pins = tuple(api.PinnedFile(pathlib.Path(path), digest) for path, digest in selection["files"])
+    private_root = snapshot_root / f"job-{job_id}-inputs"
+    private = api.snapshot_files(pins, private_root)
+    by_source = {source.path: target for source, target in zip(pins, private)}
+    body = _committed_hwdb(original_hwdb.read_bytes(), hw_config)
+    archives = []
+    all_member_names = set()
+    for field, uri, basename in selection["uris"]:
+        pin = by_source[_local_input_path(uri)]
+        members = _archive_members(pin.path)
+        reserved = {x[2] for x in selection["uris"]} | {x[1] for x in selection["slots"]}
+        if all_member_names.intersection(members) or reserved.intersection(members):
+            raise RuntimeError("different selected archives overwrite the same member")
+        all_member_names.update(members)
+        archives.append(
+            {
+                "field": field,
+                "source_uri": uri,
+                "private_uri": pin.path.as_uri(),
+                "basename": basename,
+                "sha256": pin.sha256,
+                "members": members,
+            }
+        )
+        body[hw_config][field] = pin.path.as_uri()
+    effective = private_root / "effective-hwdb.yaml"
+    with effective.open("xb") as stream:
+        stream.write(yaml.safe_dump(body, sort_keys=False).encode())
+        stream.flush()
+        os.fsync(stream.fileno())
+    effective.chmod(0o444)
+    effective_pin = api.PinnedFile(effective, hashlib.sha256(effective.read_bytes()).hexdigest())
+    state = {
+        "private_files": private,
+        "effective": effective_pin,
+        "staged": by_source[pathlib.Path(stage_from)],
+        "archives": archives,
+        "slots": selection["slots"],
+        "original_hwdb": api.PinnedFile(original_hwdb, hashlib.sha256(original_hwdb.read_bytes()).hexdigest()),
+        "root": private_root,
+    }
+    return state
+
+
+def _private_runtime_input(state, path):
+    api = _pinned_file_api()
+    pin = api.PinnedFile(path, hashlib.sha256(path.read_bytes()).hexdigest())
+    state["runtime"] = api.snapshot_files((pin,), state["root"] / "runtime-input")[0]
+    return state["runtime"].path
+
+
+def _verify_committed_inputs(state, staged, simulation_dir, phase, *, consumed):
+    api = _pinned_file_api()
+    if simulation_dir.resolve() != simulation_dir or simulation_dir.is_symlink() or not simulation_dir.is_dir():
+        raise RuntimeError("simulation root is absent or aliases another path")
+    files = list(state["private_files"]) + [
+        state["effective"],
+        state["original_hwdb"],
+        api.PinnedFile(staged, state["staged"].sha256),
+    ]
+    if "runtime" in state:
+        files.append(state["runtime"])
+    if consumed:
+        for directory, elf_name in state["slots"]:
+            slot = simulation_dir / directory
+            if (
+                slot.resolve() != slot
+                or slot.is_symlink()
+                or not slot.is_dir()
+                or not slot.is_relative_to(simulation_dir.resolve())
+            ):
+                raise RuntimeError("consumed slot is absent or aliases its declared location")
+            files.append(api.PinnedFile(slot / elf_name, state["staged"].sha256))
+            for archive in state["archives"]:
+                files.append(api.PinnedFile(slot / archive["basename"], archive["sha256"]))
+                for name, digest in archive["members"].items():
+                    files.append(api.PinnedFile(slot / name, digest))
+    api.verify_files(tuple(files))
+    observation = {
+        "phase": phase,
+        "consumed": consumed,
+        "scope": "declared_file_and_slot_bytes_only",
+        "files": [{"path": str(x.path), "sha256": x.sha256} for x in files],
+        "original_hwdb_sha256": state["original_hwdb"].sha256,
+        "effective_hwdb_sha256": state["effective"].sha256,
+        "archives": state["archives"],
+        "slots": state["slots"],
+    }
+    path = state["root"] / f"observed-{phase}.json"
+    with path.open("x") as stream:
+        json.dump(observation, stream, sort_keys=True, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    path.chmod(0o444)
+
+
+def _record_committed_refusal(state, phase, error, *, job_id=None):
+    try:
+        if state is not None:
+            path = state["root"] / f"refused-{phase}.json"
+        elif job_id is not None:
+            path = _prepare_hwdb_snapshot_root() / f"job-{job_id}-refused-{phase}.json"
+        else:
+            return
+        with path.open("x") as stream:
+            json.dump(
+                {
+                    "phase": phase,
+                    "scope": "declared_file_and_slot_bytes_only",
+                    "outcome": "refused",
+                    "detail": str(error)[:2048],
+                },
+                stream,
+            )
+        path.chmod(0o444)
+    except (OSError, RuntimeError) as observation_error:
+        # Diagnostic publication cannot suppress mandatory native teardown.
+        print(f"[daemon] committed refusal observation unavailable: {observation_error}", file=sys.stderr)
 def cmd_runworkload_full(args: argparse.Namespace) -> int:
+    _require_shared_group()
     conn = _connect()
     alive, age = _daemon_alive(conn)
     if not alive:
@@ -701,6 +1146,49 @@ def cmd_runworkload_full(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return 2
 
+    # Optional exact hardware-database authority.  The submitter commits the
+    # source bytes by hash now; the daemon re-hashes and snapshots them into
+    # the job directory under the FPGA lock immediately before any FireSim
+    # phase.  FireSim is then invoked with -a <snapshot>, never the mutable
+    # shared config_hwdb.yaml.  Keeping this optional preserves existing
+    # non-evidence jobs; provenance-sensitive callers require it downstream.
+    hwdb_config_artifact = None
+    hwdb_config_artifact_sha256 = None
+    if getattr(args, "hwdb_config_artifact", None):
+        if not getattr(args, "hw_config", None):
+            print("error: --hwdb-config-artifact requires --hw-config",
+                  file=sys.stderr)
+            return 2
+        hwdb_path = pathlib.Path(args.hwdb_config_artifact).resolve()
+        if not hwdb_path.is_file():
+            print(f"error: --hwdb-config-artifact is not a file: {hwdb_path}",
+                  file=sys.stderr)
+            return 2
+        try:
+            hwdb_raw = hwdb_path.read_bytes()
+        except OSError as exc:
+            print(f"error: cannot read --hwdb-config-artifact {hwdb_path}: {exc}",
+                  file=sys.stderr)
+            return 2
+        if not hwdb_raw:
+            print(f"error: --hwdb-config-artifact is empty: {hwdb_path}",
+                  file=sys.stderr)
+            return 2
+        hwdb_config_artifact = str(hwdb_path)
+        hwdb_config_artifact_sha256 = hashlib.sha256(hwdb_raw).hexdigest()
+
+    committed_inputs = None
+    try:
+        committed_inputs = _committed_declaration(
+            getattr(args, "committed_file", None),
+            getattr(args, "consumed_slot", None),
+            getattr(args, "hwdb_local_uri", None), stage_from=stage_from,
+            bootbinary=bootbinary, hw_config=getattr(args, "hw_config", None),
+            hwdb_raw=hwdb_raw if hwdb_config_artifact else b"")
+    except Exception as exc:
+        print(f"error: invalid committed input selection: {exc}", file=sys.stderr)
+        return 2
+
     now = time.time()
     user = args.user or getpass.getuser()
     # The "cmd" column gets a human-readable summary so existing TUIs +
@@ -710,6 +1198,9 @@ def cmd_runworkload_full(args: argparse.Namespace) -> int:
                    f"timeout={args.timeout}s")
     if stage_from:
         cmd_summary += f" stage_from={os.path.basename(stage_from)}"
+    if hwdb_config_artifact:
+        cmd_summary += (" hwdb_config_artifact="
+                        f"{os.path.basename(hwdb_config_artifact)}")
 
     cwd = str(deploy)
     env_keep = {}
@@ -728,6 +1219,11 @@ def cmd_runworkload_full(args: argparse.Namespace) -> int:
         "bootbinary": bootbinary,
         "stage_from": stage_from,
         "timeout": int(args.timeout),
+        # None = inherit the chipyard template's default_hw_config (previous behaviour).
+        "hw_config": getattr(args, "hw_config", None),
+        "hwdb_config_artifact": hwdb_config_artifact,
+        "hwdb_config_artifact_sha256": hwdb_config_artifact_sha256,
+        "committed_inputs": committed_inputs,
     })
 
     cur = conn.execute(
@@ -740,6 +1236,7 @@ def cmd_runworkload_full(args: argparse.Namespace) -> int:
     job_id = cur.lastrowid
     workdir = JOBS_DIR / str(job_id)
     workdir.mkdir(parents=True, exist_ok=True)
+    _share_dir(workdir)
     # Drop a human-readable description of what the daemon will run —
     # mirrors the legacy `cmd.sh` so debugging stays similar.
     (workdir / "runworkload-full.json").write_text(
@@ -757,6 +1254,9 @@ def cmd_runworkload_full(args: argparse.Namespace) -> int:
           f"bootbinary={bootbinary}")
     if stage_from:
         print(f"[firesim-queue]   stage_from={stage_from}")
+    if hwdb_config_artifact:
+        print("[firesim-queue]   hwdb_config_artifact="
+              f"{hwdb_config_artifact} sha256={hwdb_config_artifact_sha256}")
     print(f"[firesim-queue]   timeout={args.timeout}s")
     eta, kind, n = _estimate_eta(conn, cmd_summary)
     if eta is not None:
@@ -898,26 +1398,37 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     Ownership: rejects when the requesting UID doesn't match the job's
     owner_uid. Legacy rows (no owner_uid) fall back to username
-    comparison. `--force` bypasses the check, intended for ops use only.
+    comparison. `--force` is restricted to root or members of the fixed
+    host-level `firesim-admins` group.
     """
     conn = _connect()
     row = conn.execute(
-        "SELECT user, state, owner_uid FROM jobs WHERE id=?",
+        "SELECT user, state, owner_uid, phase FROM jobs WHERE id=?",
         (args.job_id,)).fetchone()
     if row is None:
         print(f"error: job {args.job_id} not found", file=sys.stderr)
         return 1
-    user, state, owner_uid = row
+    user, state, owner_uid, phase = row
     me_uid = os.geteuid()
     me = getpass.getuser()
     # Owner check: prefer UID match when available, fall back to username
     # for legacy rows where owner_uid was NULL at insert time.
     is_owner = ((owner_uid is not None and int(owner_uid) == me_uid)
                 or (owner_uid is None and user == me))
-    if not is_owner and not args.force:
+    is_admin = _is_queue_admin(me_uid)
+    if args.force and not is_admin:
+        print(f"error: --force is restricted to root or members of the "
+              f"'{ADMIN_GROUP}' group; you are uid={me_uid}.",
+              file=sys.stderr)
+        return 1
+    if not is_owner and not (args.force and is_admin):
+        admin_hint = (" Pass --force to use your queue-admin override."
+                      if is_admin else
+                      f" Ask the job owner or a member of '{ADMIN_GROUP}' "
+                      "to cancel it.")
         print(f"error: job {args.job_id} owned by {user}"
               + (f" (uid={owner_uid})" if owner_uid is not None else "")
-              + f", not you (uid={me_uid}). Pass --force to override.",
+              + f", not you (uid={me_uid})." + admin_hint,
               file=sys.stderr)
         return 1
 
@@ -944,16 +1455,30 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         conn.execute(
             "UPDATE jobs SET cancel_requested=? WHERE id=?",
             (time.time(), args.job_id))
-        print(f"[firesim-queue] cancel requested for RUNNING job "
-              f"{args.job_id} — daemon will tear down (kill + firesim kill)")
+        if phase in CANCEL_DEFERRED_PHASES or phase in (None, "STAGING",
+                                                          "LEADING_KILL"):
+            # Not yet (or currently) flashing: the daemon lets any flash
+            # finish, then tears down without running the workload.
+            print(f"[firesim-queue] cancel requested for RUNNING job "
+                  f"{args.job_id} (phase={phase or '-'}) — if it is flashing "
+                  f"the FPGA the flash completes first (interrupting it drops "
+                  f"the card off PCIe), then the daemon tears down without "
+                  f"running the workload")
+            grace = (FIRESIM_KILL_TIMEOUT_SECONDS
+                     + FIRESIM_INFRASETUP_TIMEOUT_SECONDS
+                     + FIRESIM_KILL_TIMEOUT_SECONDS + 60)
+        else:
+            print(f"[firesim-queue] cancel requested for RUNNING job "
+                  f"{args.job_id} — daemon will tear down (kill + firesim kill)")
+            grace = 120
         if args.no_wait:
             return 0
         # Block until the daemon picks up the flag and transitions us
         # to a terminal state. The daemon's watcher checks every
-        # POLL_INTERVAL_SECONDS so this should take a few seconds at most
-        # before the SIGTERM lands; the trailing `firesim kill` cleanup
-        # can take ~10-30s depending on bitstream state.
-        deadline = time.time() + 120  # 2-min grace
+        # POLL_INTERVAL_SECONDS; in RUNNING the SIGTERM lands within seconds
+        # and the trailing `firesim kill` takes ~10-30s.  A cancel that
+        # lands before or during INFRASETUP waits for the flash to finish.
+        deadline = time.time() + grace
         while time.time() < deadline:
             r = conn.execute("SELECT state FROM jobs WHERE id=?",
                              (args.job_id,)).fetchone()
@@ -962,7 +1487,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
                 return 0
             time.sleep(1.0)
         print(f"[firesim-queue] warning: job {args.job_id} still not "
-              f"terminal after 120s; daemon may be stuck. Check "
+              f"terminal after {grace}s; daemon may be stuck. Check "
               f"`firesim-queue status`.", file=sys.stderr)
         return 1
 
@@ -1062,20 +1587,6 @@ def _run_one_job_bash(conn: sqlite3.Connection, job: dict) -> int:
     env = json.loads(job["env_json"])
     final_env = dict(os.environ)
     final_env.update(env)
-    # OPTION A: run the job AS THE SUBMITTER. The daemon runs as root and drops
-    # privileges (setgid -> initgroups -> setuid) to the submitting user via the
-    # preexec_fn below, so the job executes with the submitter's uid, HOME, ssh
-    # keys, caches, and file access -- eliminating cross-user permission issues.
-    import pwd as _pwd
-    _upw = _pwd.getpwnam(job["user"])
-    final_env["HOME"] = _upw.pw_dir
-    final_env["USER"] = _upw.pw_name
-    final_env["LOGNAME"] = _upw.pw_name
-    _uid, _gid, _uname = _upw.pw_uid, _upw.pw_gid, _upw.pw_name
-    def _job_preexec():
-        os.setgid(_gid)
-        os.initgroups(_uname, _gid)
-        os.setuid(_uid)
 
     started = time.time()
     conn.execute(
@@ -1099,7 +1610,7 @@ def _run_one_job_bash(conn: sqlite3.Connection, job: dict) -> int:
                     ["bash", str(workdir / "cmd.sh")],
                     cwd=job["cwd"], env=final_env,
                     stdout=so, stderr=se,
-                    preexec_fn=_job_preexec, start_new_session=True)
+                    start_new_session=True)
                 conn.execute("UPDATE jobs SET pid=? WHERE id=?",
                              (proc.pid, job["id"]))
                 # Watch loop: heartbeat + check for owner-requested cancel.
@@ -1163,9 +1674,79 @@ def _set_phase(conn: sqlite3.Connection, job_id: int, phase: str):
     conn.execute("UPDATE jobs SET phase=? WHERE id=?", (phase, job_id))
 
 
+# Phases whose subprocess must never be signalled on a cancel request.
+# INFRASETUP flashes the FPGA: FireSim removes the card's xdma device, programs
+# the bitstream, then rescans PCIe.  A SIGTERM between the remove and the rescan
+# leaves the U250 off the bus for every user until someone reprograms it over
+# JTAG or power-cycles the host (job 1139, 2026-09-26: cancelled 120 s into its
+# infrasetup; every later job failed "Unable to obtain Extended Device BDF").
+# A cancel observed in these phases is recorded and honoured once the phase
+# exits on its own: the job then skips RUNNING and goes straight to TEARDOWN.
+CANCEL_DEFERRED_PHASES = frozenset({"INFRASETUP"})
+
+
+def _supervise_phase(proc: subprocess.Popen, *, phase: str, job_id: int,
+                     check_cancel, heartbeat,
+                     poll_cancel: bool = False,
+                     wall_timeout: float | None = None,
+                     sleep_s: float | None = None) -> tuple[int, str]:
+    """Wait for one phase's process group; return (rc, hint).
+
+    hint is 'DONE', 'CANCELLED' or 'TIMEOUT'.  A cancel in a phase listed in
+    CANCEL_DEFERRED_PHASES never signals the process: the phase runs to
+    completion and the hint is 'CANCELLED' so the caller skips what follows.
+    The wall timeout still applies there -- it bounds a wedged control plane,
+    which is a different failure from an owner changing their mind.
+    """
+    if sleep_s is None:
+        sleep_s = min(HEARTBEAT_INTERVAL_SECONDS, POLL_INTERVAL_SECONDS)
+    deadline = (time.time() + wall_timeout) if wall_timeout else None
+    deferred = False
+
+    def _terminate() -> int:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            return proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return proc.wait()
+
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        if poll_cancel and not deferred and check_cancel():
+            if phase in CANCEL_DEFERRED_PHASES:
+                deferred = True
+                print(f"[daemon] job_id={job_id} cancel requested in "
+                      f"phase={phase} -- deferred until the phase exits "
+                      f"(signalling it mid-flash drops the FPGA off PCIe)",
+                      flush=True)
+            else:
+                print(f"[daemon] job_id={job_id} cancel requested in "
+                      f"phase={phase} — SIGTERM", flush=True)
+                return _terminate(), "CANCELLED"
+        if deadline and time.time() > deadline:
+            print(f"[daemon] job_id={job_id} timeout in phase={phase} "
+                  f"({wall_timeout}s elapsed) — SIGTERM", flush=True)
+            return _terminate(), "TIMEOUT"
+        heartbeat()
+        time.sleep(sleep_s)
+    if deferred:
+        print(f"[daemon] job_id={job_id} phase={phase} exited rc={rc}; "
+              f"honouring the deferred cancel", flush=True)
+        return rc, "CANCELLED"
+    return rc, "DONE"
+
+
 def _render_per_job_runtime_yaml(template_path: pathlib.Path,
                                  out_path: pathlib.Path,
-                                 workload_name: str, suffix_tag: str):
+                                 workload_name: str, suffix_tag: str,
+                                 hw_config: str | None = None,
+                                 simulation_dir: str | None = None):
     """Write a per-job config_runtime.yaml for this run.
 
     We don't parse YAML (avoids a dep). Instead we copy the chipyard
@@ -1175,6 +1756,15 @@ def _render_per_job_runtime_yaml(template_path: pathlib.Path,
       workload:
           workload_name: <X>
           suffix_tag: <Y>
+      target_config:
+          default_hw_config: <Z>      # only when --hw-config is given
+      run_farm.recipe_arg_overrides:
+          default_simulation_dir: <job-private path>
+
+    `default_hw_config` names the BITSTREAM the job flashes. Left to the shared
+    template it is global mutable state: two users wanting different designs
+    race, and the loser silently runs the other's hardware. Passing it per job
+    makes the design a property of the job, like the workload already is.
 
     The template's other settings (target_config, tracing, host_debug,
     etc.) flow through unchanged — that's intentional. Anyone wanting
@@ -1186,8 +1776,13 @@ def _render_per_job_runtime_yaml(template_path: pathlib.Path,
     # firesim CLI populates config_runtime.yaml on first sourceme run,
     # so this should usually exist.
     if not template_path.exists():
+        hw = f"target_config:\n    default_hw_config: {hw_config}\n" if hw_config else ""
+        farm = ("run_farm:\n  recipe_arg_overrides:\n"
+                f"    default_simulation_dir: {simulation_dir}\n"
+                if simulation_dir else "")
         out_path.write_text(
-            f"workload:\n"
+            farm + hw
+            + f"workload:\n"
             f"    workload_name: {workload_name}.json\n"
             f"    terminate_on_completion: no\n"
             f"    suffix_tag: {suffix_tag}\n"
@@ -1197,10 +1792,32 @@ def _render_per_job_runtime_yaml(template_path: pathlib.Path,
     lines = template_path.read_text().splitlines()
     out_lines: list[str] = []
     in_workload = False
+    in_target = False
     saw_name = False
     saw_suffix = False
+    saw_hw = False
     for line in lines:
         stripped = line.lstrip()
+        if simulation_dir and stripped.startswith("default_simulation_dir:"):
+            indent = line[:len(line) - len(stripped)]
+            out_lines.append(f"{indent}default_simulation_dir: {simulation_dir}")
+            continue
+        # `target_config:` is tracked exactly like `workload:` below: enter on the top-level key,
+        # leave on the next one. Only the default_hw_config line inside it is rewritten.
+        if line.startswith("target_config:"):
+            in_target = True
+            out_lines.append(line)
+            continue
+        if in_target and line and not line[0].isspace() and not line.startswith("#"):
+            if hw_config and not saw_hw:
+                out_lines.append(f"    default_hw_config: {hw_config}")
+                saw_hw = True
+            in_target = False
+        if in_target and hw_config and stripped.startswith("default_hw_config:"):
+            indent = line[:len(line) - len(stripped)]
+            out_lines.append(f"{indent}default_hw_config: {hw_config}")
+            saw_hw = True
+            continue
         # Track when we enter / exit the `workload:` mapping. A new
         # top-level key (no indent) ends the section.
         if line.startswith("workload:"):
@@ -1228,6 +1845,8 @@ def _render_per_job_runtime_yaml(template_path: pathlib.Path,
                 saw_suffix = True
                 continue
         out_lines.append(line)
+    if in_target and hw_config and not saw_hw:
+        out_lines.append(f"    default_hw_config: {hw_config}")
     # Trailing flush if `workload:` was the last top-level key.
     if in_workload:
         if not saw_name:
@@ -1235,6 +1854,78 @@ def _render_per_job_runtime_yaml(template_path: pathlib.Path,
         if not saw_suffix:
             out_lines.append(f"    suffix_tag: {suffix_tag}")
     out_path.write_text("\n".join(out_lines) + "\n")
+
+
+def _deploy_overlay(workdir: pathlib.Path, deploy: pathlib.Path,
+                    workload: str, bootbinary: str) -> pathlib.Path:
+    """Build a per-job stand-in for the submitter's `deploy/` directory.
+
+    FireSim writes workloads, logs, results and topology diagrams relative to
+    its deployment directory. Other inputs are reached through the original
+    deployment tree or passed with an explicit configuration flag.
+
+    When the daemon and the submitter are different people, those three writes
+    land in a tree the daemon has no write bit on. That is what killed jobs
+    419 and 422 -- and no amount of chmod on the *queue* fixes it, because the
+    directory being written belongs to the submitter's chipyard checkout.
+
+    So: symlink the deploy dir into the job dir and replace those writable
+    entries with real directories the daemon owns. FireSim sees an ordinary
+    deploy tree; the writes land in the queue root, under the job that caused
+    them. Read-only state (config_hwdb.yaml, build recipes, the sim binaries)
+    is reached through the symlinks and stays shared, as it should be.
+    """
+    overlay = workdir / "deploy_overlay"
+    overlay.mkdir(parents=True, exist_ok=True)
+
+    def _link(src: pathlib.Path, dst: pathlib.Path) -> None:
+        if not dst.is_symlink() and not dst.exists():
+            dst.symlink_to(src)
+
+    # The public CLI and platform utilities resolve ../platforms from deploy.
+    # Preserve that original sibling under the private overlay parent.
+    platform_source = (deploy.parent / "platforms").resolve(strict=True)
+    if not platform_source.is_dir():
+        raise RuntimeError("FireSim platform source sibling is not a directory")
+    platform_destination = workdir / "platforms"
+    if platform_destination.is_symlink():
+        if platform_destination.resolve(strict=True) != platform_source:
+            raise RuntimeError("FireSim overlay platform sibling identity differs")
+    elif platform_destination.exists():
+        raise RuntimeError("FireSim overlay platform sibling already exists")
+    else:
+        platform_destination.symlink_to(platform_source, target_is_directory=True)
+
+    # Everything except the cwd-relative writers is a symlink.
+    private = {"workloads", "logs", "results-workload", "generated-topology-diagrams"}
+    for entry in deploy.iterdir():
+        if entry.name not in private:
+            _link(entry, overlay / entry.name)
+    for name in ("logs", "results-workload", "generated-topology-diagrams"):
+        (overlay / name).mkdir(exist_ok=True)
+
+    # `workloads/` is half theirs, half ours: the daemon must be able to write
+    # the staged bootbinary, but every other workload JSON in the submitter's
+    # tree has to stay visible or FireSim cannot resolve the run at all. Mirror
+    # the directory as symlinks, then carve out just the one workload.
+    wl = overlay / "workloads"
+    wl.mkdir(exist_ok=True)
+    src_wl = deploy / "workloads"
+    if src_wl.is_dir():
+        for entry in src_wl.iterdir():
+            if entry.name != workload:
+                _link(entry, wl / entry.name)
+
+    # Same trick one level down: keep the workload's rootfs and friends
+    # reachable, own only the bootbinary we are about to stage over.
+    dst_wl = wl / workload
+    dst_wl.mkdir(exist_ok=True)
+    src_wl_dir = src_wl / workload
+    if src_wl_dir.is_dir():
+        for entry in src_wl_dir.iterdir():
+            if entry.name != bootbinary:
+                _link(entry, dst_wl / entry.name)
+    return overlay
 
 
 def _run_one_job_runworkload_full(conn: sqlite3.Connection,
@@ -1250,7 +1941,9 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
     State machine outcomes:
       DONE       — every phase rc=0
       FAILED     — any phase rc != 0 (TEARDOWN still ran)
-      CANCELLED  — owner set cancel_requested mid-RUNNING
+      CANCELLED  — owner set cancel_requested; RUNNING is signalled at
+                   once, INFRASETUP (the FPGA flash) finishes first and the
+                   job then skips RUNNING (see CANCEL_DEFERRED_PHASES)
       TIMEOUT    — wall-clock --timeout fired mid-RUNNING
 
     The FPGA lock is held continuously across all four phases. xdma
@@ -1267,6 +1960,13 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
     workload = kind_args["workload"]
     bootbinary = kind_args["bootbinary"]
     stage_from = kind_args.get("stage_from")
+    hwdb_config_artifact = kind_args.get("hwdb_config_artifact")
+    hwdb_config_artifact_sha256 = kind_args.get(
+        "hwdb_config_artifact_sha256")
+    committed_selection = kind_args.get("committed_inputs")
+    committed_state = None
+    staged_input = None
+    effective_hwdb_sha256 = hwdb_config_artifact_sha256
     # timeout==0 means "no cap" — let firesim runworkload exit on its
     # own. Anything > 0 arms the daemon's wall-clock SIGTERM timer.
     timeout_s = int(kind_args.get("timeout", 0))
@@ -1277,31 +1977,36 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
     sourceme = firesim_root / "sourceme-manager.sh"
     template_yaml = deploy / "config_runtime.yaml"
 
+    # Cross-user dispatch: when the daemon cannot write the submitter's
+    # deploy tree, run against a per-job overlay of it instead. Same-user
+    # jobs keep the exact pre-overlay behaviour -- this path only engages
+    # where the old one already failed outright, so it cannot regress the
+    # common case.
+    if os.access(deploy, os.W_OK):
+        run_dir = deploy
+    else:
+        run_dir = _deploy_overlay(workdir, deploy, workload, bootbinary)
+        print(f"[daemon] job_id={job['id']} user={job['user']}: {deploy} is not"
+              f" writable by this daemon; running under overlay {run_dir}",
+              flush=True)
+
     # Per-job artifacts under the queue's jobs dir. The per-job
     # config_runtime.yaml is what we hand to `firesim -c` so we never
     # mutate the shared deploy/config_runtime.yaml.
     per_job_yaml = workdir / "config_runtime.yaml"
+    per_job_hwdb = None
     suffix_tag = f"q{job_id}"
-    _render_per_job_runtime_yaml(template_yaml, per_job_yaml,
-                                 workload, suffix_tag)
+    simulation_dir = workdir / "simulation"
+    if committed_selection is None:
+        simulation_dir.mkdir(exist_ok=True)
+        _render_per_job_runtime_yaml(
+            template_yaml, per_job_yaml, workload, suffix_tag,
+            hw_config=kind_args.get("hw_config"),
+            simulation_dir=str(simulation_dir))
 
     env = json.loads(job["env_json"])
     final_env = dict(os.environ)
     final_env.update(env)
-    # OPTION A: run the job AS THE SUBMITTER. The daemon runs as root and drops
-    # privileges (setgid -> initgroups -> setuid) to the submitting user via the
-    # preexec_fn below, so the job executes with the submitter's uid, HOME, ssh
-    # keys, caches, and file access -- eliminating cross-user permission issues.
-    import pwd as _pwd
-    _upw = _pwd.getpwnam(job["user"])
-    final_env["HOME"] = _upw.pw_dir
-    final_env["USER"] = _upw.pw_name
-    final_env["LOGNAME"] = _upw.pw_name
-    _uid, _gid, _uname = _upw.pw_uid, _upw.pw_gid, _upw.pw_name
-    def _job_preexec():
-        os.setgid(_gid)
-        os.initgroups(_uname, _gid)
-        os.setuid(_uid)
 
     started = time.time()
     conn.execute(
@@ -1315,6 +2020,10 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
 
     so = stdout_path.open("wb")
     se = stderr_path.open("wb")
+    # A prelaunch validation/staging failure must not touch FireSim at all.
+    # Once the leading kill begins, however, trailing kill remains mandatory.
+    firesim_started = False
+    hwdb_snapshot_ready = not bool(hwdb_config_artifact)
 
     def _write_banner(label: str):
         so.write(f"\n=== [firesim-queue] phase={label} "
@@ -1332,22 +2041,58 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
         per_yaml = shlex.quote(str(per_job_yaml))
         env_q = shlex.quote(str(env_script))
         sm_q = shlex.quote(str(sourceme))
-        deploy_q = shlex.quote(str(deploy))
+        # run_dir is `deploy` for same-user jobs and the per-job overlay for
+        # cross-user ones (see _deploy_overlay).
+        deploy_q = shlex.quote(str(run_dir))
         # Drop any inherited conda state so chipyard's activate is a
         # clean operation. Same pattern as the legacy bash blob, just
         # owned by the daemon now.
+        if per_job_hwdb is not None and not hwdb_snapshot_ready:
+            raise RuntimeError(
+                "refusing FireSim command before immutable HWDB snapshot")
+        hwdb_arg = (f"-a {shlex.quote(str(per_job_hwdb))} "
+                    if per_job_hwdb is not None else "")
+        conda_bin = os.environ.get("FIRESIM_QUEUE_CONDA_BIN")
+        conda_path = (f"export PATH={shlex.quote(conda_bin)}:$PATH; "
+                      if conda_bin else "")
         inner = (
             f"set -e; "
             f"unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER "
             f"CONDA_PYTHON_EXE CONDA_SHLVL CONDA_EXE _CE_M _CE_CONDA; "
+            f"{conda_path}"
             f"source {env_q}; "
             f"cd {shlex.quote(str(firesim_root))}; "
             f"source {sm_q} --skip-ssh-setup; "
             f"cd {deploy_q}; "
             f"{extra_setup}"
-            f"firesim -c {per_yaml} {sub}"
+            f"{shlex.quote(str(run_dir / 'firesim')) if run_dir != deploy else 'firesim'} "
+            f"-c {per_yaml} {hwdb_arg}{sub}"
         )
         return ["bash", "-c", inner]
+
+    def _verify_hwdb_snapshot(phase: str) -> str:
+        if per_job_hwdb is None and not hwdb_config_artifact:
+            return ""
+        if per_job_hwdb is None or not hwdb_snapshot_ready:
+            raise RuntimeError(
+                "refusing FireSim command before immutable HWDB snapshot")
+        try:
+            observed = hashlib.sha256(per_job_hwdb.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot verify immutable HWDB snapshot before {phase}: {exc}"
+            ) from exc
+        if observed != effective_hwdb_sha256:
+            raise RuntimeError(
+                f"immutable HWDB snapshot changed before {phase}: expected "
+                f"{effective_hwdb_sha256}, observed {observed}"
+            )
+        so.write(
+            f"hwdb verify phase={phase} sha256={observed} "
+            f"path={per_job_hwdb}\n".encode()
+        )
+        so.flush()
+        return observed
 
     def _check_cancel() -> bool:
         row = conn.execute("SELECT cancel_requested FROM jobs WHERE id=?",
@@ -1363,45 +2108,14 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
         terminal state."""
         _set_phase(conn, job_id, phase)
         _write_banner(phase)
-        deadline = (time.time() + wall_timeout) if wall_timeout else None
         proc = subprocess.Popen(
-            argv, cwd=str(deploy), env=final_env,
-            stdout=so, stderr=se, preexec_fn=_job_preexec, start_new_session=True)
+            argv, cwd=str(run_dir), env=final_env,
+            stdout=so, stderr=se, start_new_session=True)
         conn.execute("UPDATE jobs SET pid=? WHERE id=?", (proc.pid, job_id))
-        while True:
-            rc = proc.poll()
-            if rc is not None:
-                break
-            if poll_cancel and _check_cancel():
-                print(f"[daemon] job_id={job_id} cancel requested in "
-                      f"phase={phase} — SIGTERM", flush=True)
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    rc = proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    rc = proc.wait()
-                return rc, "CANCELLED"
-            if deadline and time.time() > deadline:
-                print(f"[daemon] job_id={job_id} timeout in phase={phase} "
-                      f"({wall_timeout}s elapsed) — SIGTERM", flush=True)
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    rc = proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    rc = proc.wait()
-                return rc, "TIMEOUT"
-            _heartbeat(conn)
-            time.sleep(min(HEARTBEAT_INTERVAL_SECONDS,
-                           POLL_INTERVAL_SECONDS))
-        return rc, "DONE"
+        return _supervise_phase(
+            proc, phase=phase, job_id=job_id, check_cancel=_check_cancel,
+            heartbeat=lambda: _heartbeat(conn), poll_cancel=poll_cancel,
+            wall_timeout=wall_timeout)
 
     final_state = "DONE"
     overall_rc = 0
@@ -1422,12 +2136,111 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
                 # ------ STAGING ------
                 _set_phase(conn, job_id, "STAGING")
                 _write_banner("STAGING")
+                if bool(hwdb_config_artifact) != bool(
+                        hwdb_config_artifact_sha256):
+                    se.write(b"incomplete HWDB artifact commitment in job "
+                             b"spec\n")
+                    overall_rc = 1
+                    final_state = "FAILED"
+                    raise RuntimeError("incomplete HWDB artifact commitment")
+                if hwdb_config_artifact:
+                    if (not isinstance(hwdb_config_artifact_sha256, str)
+                            or len(hwdb_config_artifact_sha256) != 64
+                            or any(c not in "0123456789abcdef"
+                                   for c in hwdb_config_artifact_sha256)):
+                        se.write(b"invalid committed HWDB artifact SHA-256 "
+                                 b"in job spec\n")
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError("invalid HWDB artifact SHA-256")
+                    hwdb_source = pathlib.Path(
+                        str(hwdb_config_artifact)).resolve()
+                    try:
+                        hwdb_raw = hwdb_source.read_bytes()
+                    except OSError as exc:
+                        se.write(f"hwdb snapshot read failed: {exc}\n".encode())
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError("hwdb snapshot read failed")
+                    observed_hwdb_sha256 = hashlib.sha256(hwdb_raw).hexdigest()
+                    if observed_hwdb_sha256 != hwdb_config_artifact_sha256:
+                        se.write(
+                            b"hwdb source changed after submission: expected "
+                            + str(hwdb_config_artifact_sha256).encode()
+                            + b" observed "
+                            + observed_hwdb_sha256.encode()
+                            + b"\n"
+                        )
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError("hwdb source changed after submission")
+                    snapshot_root = _prepare_hwdb_snapshot_root()
+                    per_job_hwdb = snapshot_root / f"job-{job_id}.yaml"
+                    try:
+                        # Exclusive creation makes a pre-created/reused job
+                        # snapshot a hard failure rather than silently
+                        # overwriting potentially untrusted bytes.
+                        with per_job_hwdb.open("xb") as snapshot_f:
+                            snapshot_f.write(hwdb_raw)
+                            snapshot_f.flush()
+                            os.fsync(snapshot_f.fileno())
+                        per_job_hwdb.chmod(0o444)
+                        snapshot_sha256 = hashlib.sha256(
+                            per_job_hwdb.read_bytes()).hexdigest()
+                    except OSError as exc:
+                        se.write(f"hwdb snapshot write failed: {exc}\n".encode())
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError("hwdb snapshot write failed")
+                    if snapshot_sha256 != hwdb_config_artifact_sha256:
+                        se.write(b"hwdb snapshot hash differs after write\n")
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError("hwdb snapshot hash differs after write")
+                    hwdb_snapshot_ready = True
+                    so.write(
+                        f"hwdb snapshot {hwdb_source} sha256="
+                        f"{snapshot_sha256} -> {per_job_hwdb}\n".encode()
+                    )
+                    so.flush()
+                if committed_selection is not None:
+                    try:
+                        if type(committed_selection) is not dict or set(committed_selection) != {"files", "slots", "uris"}:
+                            raise RuntimeError("invalid closed committed input declaration")
+                        checked = _committed_declaration(
+                            committed_selection["files"], committed_selection["slots"],
+                            committed_selection["uris"], stage_from=stage_from,
+                            bootbinary=bootbinary, hw_config=kind_args.get("hw_config"),
+                            hwdb_raw=hwdb_raw)
+                        if checked != committed_selection or checked is None:
+                            raise RuntimeError("committed input membership changed")
+                        if simulation_dir.resolve() != simulation_dir or simulation_dir.is_symlink():
+                            raise RuntimeError("simulation root aliases another path")
+                        simulation_dir.mkdir(exist_ok=True)
+                        committed_state = _private_committed_inputs(
+                            checked, snapshot_root, job_id, per_job_hwdb,
+                            kind_args["hw_config"], stage_from)
+                        per_job_hwdb = committed_state["effective"].path
+                        produced_runtime = committed_state["root"] / "runtime-produced.yaml"
+                        _render_per_job_runtime_yaml(template_yaml, produced_runtime,
+                            workload, suffix_tag, hw_config=kind_args.get("hw_config"),
+                            simulation_dir=str(simulation_dir))
+                        per_job_yaml = _private_runtime_input(committed_state, produced_runtime)
+                        effective_hwdb_sha256 = committed_state["effective"].sha256
+                        stage_from = str(committed_state["staged"].path)
+                    except Exception as exc:
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError(f"committed input preparation refused: {exc}") from exc
                 if stage_from:
-                    stage_dst_dir = deploy / "workloads" / workload
+                    stage_dst_dir = run_dir / "workloads" / workload
                     stage_dst_dir.mkdir(parents=True, exist_ok=True)
                     stage_dst = stage_dst_dir / bootbinary
                     try:
+                        if committed_state is not None and stage_dst.resolve() != stage_dst:
+                            raise OSError("staged ELF destination aliases another path")
                         shutil.copy2(stage_from, stage_dst)
+                        staged_input = stage_dst
                         so.write(f"staged {stage_from} -> {stage_dst}\n"
                                  .encode())
                     except OSError as e:
@@ -1439,22 +2252,56 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
                     so.write(b"no --stage-from; assuming binary already "
                              b"staged by caller\n")
 
+                if committed_state is not None:
+                    try:
+                        _verify_committed_inputs(committed_state, staged_input,
+                            simulation_dir, "before_leading_kill", consumed=False)
+                    except Exception as exc:
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError(f"committed input check refused: {exc}") from exc
+
                 # ------ INFRASETUP ------
                 # Leading kill is best-effort: cleans any prior sim's
                 # half-configured xdma / screen sessions. Then infrasetup
                 # under our per-job YAML.
                 _set_phase(conn, job_id, "INFRASETUP")
                 _write_banner("INFRASETUP")
-                # Best-effort kill, ignore rc.
+                # Best-effort kill, ignore its ordinary nonzero rc (there may
+                # simply be no simulator).  It is still process-group bounded
+                # and cancellation-aware: Fabric has been observed to wedge in
+                # its local pkill path, and an unbounded subprocess.run here
+                # made both the queue heartbeat and cancel request ineffective.
+                _verify_hwdb_snapshot("before_leading_kill")
                 kill_argv = _firesim_cmd("kill")
-                # Wrap in `|| true` so a failed kill (nothing to kill)
-                # doesn't trip our `set -e`. We do that by calling
-                # bash with a sub-pipe.
-                subprocess.run(kill_argv, cwd=str(deploy), env=final_env, preexec_fn=_job_preexec,
-                               stdout=so, stderr=se, check=False)
+                firesim_started = True
+                rc_kill, hint_kill = _run_phase(
+                    "LEADING_KILL", kill_argv, poll_cancel=True,
+                    wall_timeout=FIRESIM_KILL_TIMEOUT_SECONDS)
+                if hint_kill == "CANCELLED":
+                    overall_rc = rc_kill or 1
+                    final_state = "CANCELLED"
+                    raise RuntimeError("leading kill ended CANCELLED")
+                if hint_kill == "TIMEOUT":
+                    se.write(
+                        f"warning: leading FireSim kill exceeded "
+                        f"{FIRESIM_KILL_TIMEOUT_SECONDS}s; its process group "
+                        f"was terminated and infrasetup will re-establish the "
+                        f"requested image\n".encode())
+                    se.flush()
+                _verify_hwdb_snapshot("before_infrasetup")
+                if committed_state is not None:
+                    try:
+                        _verify_committed_inputs(committed_state, staged_input,
+                            simulation_dir, "before_infrasetup", consumed=False)
+                    except Exception as exc:
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError(f"committed input check refused: {exc}") from exc
                 infra_argv = _firesim_cmd("infrasetup")
                 rc_infra, hint_infra = _run_phase(
-                    "INFRASETUP", infra_argv, poll_cancel=True)
+                    "INFRASETUP", infra_argv, poll_cancel=True,
+                    wall_timeout=FIRESIM_INFRASETUP_TIMEOUT_SECONDS)
                 if hint_infra != "DONE":
                     overall_rc = rc_infra or 1
                     final_state = hint_infra
@@ -1467,6 +2314,15 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
                 # ------ RUNNING ------
                 # timeout_s == 0 → no wall-clock cap (pass None to
                 # _run_phase). > 0 → enforce.
+                _verify_hwdb_snapshot("before_runworkload")
+                if committed_state is not None:
+                    try:
+                        _verify_committed_inputs(committed_state, staged_input,
+                            simulation_dir, "before_runworkload", consumed=True)
+                    except Exception as exc:
+                        overall_rc = 1
+                        final_state = "FAILED"
+                        raise RuntimeError(f"consumed input check refused: {exc}") from exc
                 run_argv = _firesim_cmd("runworkload")
                 rc_run, hint_run = _run_phase(
                     "RUNNING", run_argv, poll_cancel=True,
@@ -1478,10 +2334,16 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
                 else:
                     overall_rc = rc_run or 1
                     final_state = hint_run
-            except RuntimeError:
+            except RuntimeError as exc:
+                if committed_selection is not None:
+                    overall_rc = overall_rc or 1
+                    if final_state == "DONE":
+                        final_state = "FAILED"
+                    _record_committed_refusal(committed_state, "lifecycle", exc, job_id=job_id)
                 # Phase signalled failure / cancel / timeout — fall
                 # through to TEARDOWN (always runs).
-                pass
+                se.write(f"FireSim lifecycle failed: {exc}\n".encode())
+                se.flush()
             finally:
                 # ------ TEARDOWN ------
                 # Always runs, regardless of upstream state. Best-effort.
@@ -1490,9 +2352,43 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
                 # release cleanly under our own lock.
                 _set_phase(conn, job_id, "TEARDOWN")
                 _write_banner("TEARDOWN")
-                kill_argv = _firesim_cmd("kill")
-                subprocess.run(kill_argv, cwd=str(deploy), env=final_env, preexec_fn=_job_preexec,
-                               stdout=so, stderr=se, check=False)
+                if firesim_started:
+                    try:
+                        # Optional byte refusal must not suppress mandatory kill.
+                        # Its immutable selections are checked after teardown.
+                        if committed_state is None:
+                            _verify_hwdb_snapshot("before_trailing_kill")
+                        kill_argv = _firesim_cmd("kill")
+                        _rc_teardown, _hint_teardown = _run_phase(
+                            "TEARDOWN", kill_argv, poll_cancel=False,
+                            wall_timeout=FIRESIM_KILL_TIMEOUT_SECONDS)
+                        if _hint_teardown == "TIMEOUT":
+                            se.write(
+                                f"FireSim teardown exceeded "
+                                f"{FIRESIM_KILL_TIMEOUT_SECONDS}s; its process "
+                                f"group was terminated\n".encode())
+                            se.flush()
+                            overall_rc = overall_rc or 1
+                            if final_state == "DONE":
+                                final_state = "FAILED"
+                        _verify_hwdb_snapshot("after_trailing_kill")
+                        if committed_state is not None:
+                            try:
+                                _verify_committed_inputs(committed_state, staged_input,
+                                    simulation_dir, "after_teardown", consumed=True)
+                            except Exception as exc:
+                                raise RuntimeError(f"consumed input changed after teardown: {exc}") from exc
+                    except RuntimeError as exc:
+                        _record_committed_refusal(committed_state, "teardown", exc)
+                        se.write(f"FireSim teardown HWDB check failed: {exc}\n"
+                                 .encode())
+                        se.flush()
+                        overall_rc = overall_rc or 1
+                        final_state = "FAILED"
+                else:
+                    so.write(b"FireSim teardown skipped: no FireSim phase "
+                             b"started\n")
+                    so.flush()
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
     finally:
         so.close()
@@ -1504,11 +2400,67 @@ def _run_one_job_runworkload_full(conn: sqlite3.Connection,
         " phase=?, cancel_requested=NULL WHERE id=?",
         (final_state, ended, overall_rc, final_state, job_id))
     _kv_set(conn, "last_user_served", job["user"])
+    # The verdict is recorded; the slot's inputs are now dead weight. AFTER the UPDATE deliberately,
+    # so a reclaim that goes wrong cannot cost the job its state.
+    _reclaim_simulation_slot(workdir, job_id)
     wall = ended - started
     print(f"[daemon] job_id={job_id} user={job['user']} "
           f"kind=runworkload-full state={final_state} rc={overall_rc} "
           f"wall={wall:.1f}s", flush=True)
     return overall_rc
+
+
+SLOT_KEEP_UNDER_BYTES = 8 * 1024 * 1024
+
+
+def _reclaim_simulation_slot(workdir: pathlib.Path, job_id: int) -> None:
+    """Drop the regenerable bulk from a finished job's simulation slot; keep everything it produced.
+
+    A slot holds ~4.7 GB of inputs the job was HANDED -- the workload ELF (twice, because
+    ``rsyncdir/`` is a staging copy of files already beside it), the RISC-V model ``.so``, the driver
+    bundle, the bitstream and its ``.mcs`` -- and ~40 KB of what the job PRODUCED: ``uartlog``, the
+    heartbeat/latency/memory CSVs, ``sim-run.sh``. Nothing removed here to reclaim the inputs, so
+    every job kept its own copy of them forever: measured 2026-09-15, 150 job dirs held 145 GB, and a
+    running sweep added about 9 GB an hour. The inputs are reproducible from the request; the outputs
+    are the run, and the run is the only thing worth keeping.
+
+    The keep rule is SIZE, not a list of names. This queue's payload names change with every workload
+    and FireSim is free to rename its own outputs; a name allowlist would keep working right up to the
+    day it silently started deleting results. No output is anywhere near the threshold, and keeping a
+    stray small binary costs nothing.
+
+    Best-effort by construction: it runs after the job's state is already recorded, and every failure
+    is logged and swallowed. Reclaiming disk must never be able to fail a job or lose its verdict.
+    Set ``FIRESIM_QUEUE_KEEP_SLOT=1`` to keep the whole slot (debugging a specific run).
+    """
+    if os.environ.get("FIRESIM_QUEUE_KEEP_SLOT") == "1":
+        return
+    slot = workdir / "simulation"
+    if not slot.is_dir():
+        return
+    dropped = kept = 0
+    freed = 0
+    try:
+        for path in sorted(slot.rglob("*")):
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                size = path.stat().st_size
+                if size < SLOT_KEEP_UNDER_BYTES:
+                    kept += 1
+                    continue
+                path.unlink()
+                dropped += 1
+                freed += size
+            except OSError as exc:
+                print(f"[daemon] job_id={job_id} slot reclaim could not remove "
+                      f"{path}: {exc}", flush=True)
+    except OSError as exc:
+        print(f"[daemon] job_id={job_id} slot reclaim could not walk {slot}: {exc}", flush=True)
+        return
+    if dropped:
+        print(f"[daemon] job_id={job_id} slot reclaim: dropped {dropped} input file(s), "
+              f"{freed / 2 ** 30:.2f} GiB; kept {kept} result file(s)", flush=True)
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
@@ -2237,15 +3189,11 @@ _PANEL_COLORS = {
 }
 
 
-# Candidate paths the simulator's UART output (the `screen -r fsim0`
-# equivalent) might land at, in priority order. The actual path is set
-# via config_runtime.yaml::default_simulation_dir on the running firesim
-# install; users override that per-host, so we probe a few well-known
-# locations + the legacy default. First file that exists wins.
-_UARTLOG_CANDIDATES = (
-    # Add other hosts' default_simulation_dir overrides here as the queue
-    # gets deployed on new machines. The legacy fallback (chipyard install
-    # firesim_rundir) is checked via workdir-based discovery below.
+# Optional host-specific UART path. The job's FireSim workdir provides the
+# fallback below; a configured path takes precedence when present.
+_UARTLOG_CANDIDATES = tuple(
+    path for path in os.environ.get("FIRESIM_QUEUE_UARTLOG", "").split(os.pathsep)
+    if path
 )
 
 
@@ -2338,7 +3286,7 @@ def _short_cmd(cmd: Optional[str], width: int = 80) -> str:
     #    firesim_runner and merlin's run_hetero.sh prepend before
     #    sourceme-manager.sh. The block looks like:
     #      bash -c 'set -e; unset CONDA_PREFIX ... CE_CONDA;
-    #      export PATH=/path/to/miniforge3/condabin:$PATH;
+    #      export PATH=/path/to/condabin:$PATH;
     #      source /path/to/env.sh; cd /path/to/firesim;
     #      source ./sourceme-manager.sh --skip-ssh-setup; ...'
     #    None of which the human reader cares about — they want to see
@@ -2988,6 +3936,10 @@ def _interactive_tail(stdscr, conn: sqlite3.Connection):
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    # Group-writable by default. The inherited 022 umask is precisely what
+    # made every cross-user job undispatchable: files landed 644 in a dir the
+    # daemon could not write.
+    os.umask(0o002)
     p = argparse.ArgumentParser(
         prog="firesim-queue", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3017,12 +3969,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_c = sub.add_parser("cancel",
         help="cancel a job by id; QUEUED -> removed, RUNNING -> "
-             "SIGTERM'd + cleaned up. Owner-only (uid match) unless "
-             "--force.")
+             "SIGTERM'd + cleaned up (a job flashing the FPGA finishes "
+             "the flash first, then skips its workload). Owner-only (uid match) unless "
+             "a queue admin uses --force.")
     p_c.add_argument("job_id", type=int)
     p_c.add_argument("--force", action="store_true",
-                     help="allow cancelling another user's job "
-                          "(ops use; bypasses the owner-UID check)")
+                     help="allow a root/firesim-admins queue administrator "
+                          "to cancel another user's job")
     p_c.add_argument("--no-wait", action="store_true",
                      help="don't block waiting for the daemon to "
                           "finish tearing down a RUNNING job; just "
@@ -3065,6 +4018,25 @@ def main(argv: list[str] | None = None) -> int:
              "runs). Common case: `--timeout 600` for a 10-min smoke "
              "or anything where you'd rather lose the run than hold "
              "the FPGA past N seconds.")
+    p_rwf.add_argument("--hw-config", dest="hw_config", default=None,
+        help="hwdb entry naming the BITSTREAM this job flashes (a key in "
+             "deploy/config_hwdb.yaml). Omitted = inherit the chipyard "
+             "template's default_hw_config. Pass it whenever more than one "
+             "design is in use: left to the shared template, two users "
+             "wanting different bitstreams race and the loser silently runs "
+             "the other's hardware.")
+    p_rwf.add_argument("--hwdb-config-artifact", default=None,
+        help="optional immutable one-entry HWDB file. Its bytes are hash-"
+             "committed at submission, snapshotted under the FPGA lock, and "
+             "passed to every FireSim phase with -a. Requires --hw-config. "
+             "Fit-evidence jobs must provide it; omitted preserves legacy "
+             "shared-config behavior for non-evidence jobs.")
+    p_rwf.add_argument("--committed-file", nargs=2, action="append", metavar=("PATH", "SHA256"),
+        help="opt-in exact staged ELF and both local HWDB archive file pins")
+    p_rwf.add_argument("--consumed-slot", nargs=2, action="append", metavar=("RELATIVE_DIR", "ELF_NAME"),
+        help="opt-in explicit consumed slot directory and renamed ELF basename")
+    p_rwf.add_argument("--hwdb-local-uri", nargs=3, action="append", metavar=("FIELD", "URI", "ARCHIVE_NAME"),
+        help="opt-in exact local bitstream_tar/driver_tar URI and slot archive basename")
     p_rwf.add_argument("--background", action="store_true",
         help="return immediately after submission")
     p_rwf.set_defaults(func=cmd_runworkload_full)
