@@ -1,213 +1,136 @@
 # firesim-queue
 
-Single-FPGA job queue with per-user fair share. Multiple users / projects
-share one physical FPGA via `firesim` — without this queue, concurrent
-`firesim runworkload` invocations clobber each other. With it, jobs land
-in a queue and execute one at a time, weighted round-robin across users.
+A single-FPGA job queue for FireSim. It runs one job at a time, with priority
+hints and round-robin scheduling across users. The daemon holds one FPGA lock
+through each job's setup, workload, and teardown.
 
-**Currently installed at:** `$FIRESIM_QUEUE_ROOT/`
-(testing location — once validated we can move to `/opt/firesim-queue/`
-for a proper global install. See **Promoting to a global install** below.)
+## Run it
 
-## What it does
-
-- **FIFO with priority hints + weighted round-robin by user.** Higher
-  priority (`--priority 10`) jumps the queue. Within a tier, alice doesn't
-  get to run 10 jobs in a row while bob waits.
-- **No preemption.** Running jobs finish on their own — critical jobs
-  jump the *queue*, not the *FPGA*.
-- **Per-job ETA from past similar runs.** Submits print expected wall;
-  the interactive dashboard shows projected start times in a Gantt chart.
-- **Per-user / per-job colors + project auto-detection.** The dashboard
-  is readable when 5 users + 3 projects are jostling. Project name comes
-  from cwd (`/scratch2/<user>/<project>/...`) — generic, no hardcoded list.
-- **Chipyard-agnostic.** Each user keeps their own chipyard tree(s); the
-  queue just locks the FPGA, doesn't know about chipyard. A user with
-  `/scratch2/<user>/chipyard-v1/` and `/scratch2/<user>/chipyard-v2/`
-  sees both as distinct projects (`chipyard-v1`, `chipyard-v2`).
-
-## Layout
-
-```
-$FIRESIM_QUEUE_ROOT/
-├── bin/
-│   ├── firesim-queue              # CLI shim (calls firesim_queue.py)
-│   └── firesim_queue.py           # the actual tool
-├── jobs/<job_id>/                 # per-job artifacts
-│   ├── cmd.sh                     # exact bash command that ran
-│   ├── stdout.log
-│   └── stderr.log
-├── queue.db                       # SQLite (WAL mode)
-├── daemon.{pid,log}
-├── fpga.lock                      # flock'd while a job runs the FPGA
-└── README.md
-```
-
-## Try it out (no FPGA needed, single-user smoke test)
+Set one shared state directory for every client and the daemon:
 
 ```bash
-PATH="$FIRESIM_QUEUE_ROOT/bin:$PATH"   # optional
-
-# Start the daemon (in another shell — leave it running).
-firesim-queue daemon
-
-# Submit a fake "FireSim run" that just sleeps. Returns when job completes.
-firesim-queue submit --priority 5 -- bash -c 'echo hello; sleep 5'
-
-# Watch the queue live.
-firesim-queue interactive
-# Keys: s submit · c cancel · t tail · u cycle usage window · r refresh · q quit
-
-# Plain text listings.
-firesim-queue status               # active jobs
-firesim-queue status --all         # incl. terminal
-firesim-queue usage --window 86400 # last 24h per-user
+export FIRESIM_QUEUE_ROOT=/path/to/shared/firesim-queue-state
+mkdir -p "$FIRESIM_QUEUE_ROOT"
+export PATH="$(pwd)/bin:$PATH"
+firesim-queue daemon                 # leave running in another shell
+firesim-queue submit -- bash -c 'echo hello; sleep 5'
+firesim-queue interactive            # q quits
 ```
 
-## Try it out (real FireSim, opt-in per script)
+The CLI and daemon use `FIRESIM_QUEUE_ROOT` for `queue.db`, `jobs/`,
+`daemon.log`, and `fpga.lock`. If it is unset, they use the checkout root.
+**Every user of one FPGA must use the same state directory.** Separate roots
+have separate locks and cannot coordinate access to the device. A production
+launcher or service should pin the root, and device permissions should prevent
+users from bypassing the queue.
 
-`benchmarks/firesim_shuttle/run_all.sh` honors `FIRESIM_QUEUE=1`. When set,
-the script routes `firesim infrasetup/runworkload/kill` through
-`firesim-queue submit`. Default (env unset) is byte-identical to the
-pre-queue behavior — no surprise routing.
+The interactive view uses [Rich](https://github.com/Textualize/rich) when
+installed, with a curses fallback. It displays the running job and phase,
+queue, projected timeline, per-user usage, recent jobs, and a live UART tail
+when readable. On terminals at least 100 columns wide, its fire animation
+refreshes with the dashboard. Keys: `s` submit, `c` cancel, `t` tail, `u`
+cycle usage window, `j`/`k` scroll, `r` refresh, `q` quit.
 
-```bash
-# In two different shells (or two different users):
-FIRESIM_QUEUE=1 ./benchmarks/firesim_shuttle/run_all.sh dronet gemmini
-FIRESIM_QUEUE=1 ./benchmarks/firesim_shuttle/run_all.sh yolov8n rvv
+## Multi-user setup
 
-# The second one blocks behind the first. Check progress:
-firesim-queue interactive
-```
+Create a shared Unix group (default `firesim`) and add each queue user and the
+daemon account. Make the state root and its `jobs/` directory group writable
+and setgid. The queue maintains group permissions on new job directories.
+Submitting users outside the group are refused when the group exists. Set
+`FIRESIM_QUEUE_GROUP` on every process if your site uses a different group.
 
-## Subcommands
+Only the job owner can cancel a job normally. Root and members of the fixed
+`firesim-admins` group can force-cancel another user's job. The administrator
+group is intentionally not selected from a caller-controlled environment
+variable.
 
-```
-firesim-queue submit [--priority N] [--project NAME] [--cwd PATH] [--background] -- <command>
+A daemon running under a service account may lack write access to a user's
+Chipyard checkout. For `runworkload-full`, the queue creates a per-job deploy
+overlay for `workloads/`, `logs/`, and `results-workload/` in that case.
+
+Host-specific settings:
+
+| Variable | Purpose |
+|---|---|
+| `FIRESIM_QUEUE_ROOT` | Shared database, lock, jobs, and logs |
+| `FIRESIM_QUEUE_GROUP` | Shared Unix group; default `firesim` |
+| `FIRESIM_QUEUE_CONDA_BIN` | Optional directory prepended to `PATH` before sourcing Chipyard's environment |
+| `FIRESIM_QUEUE_UARTLOG` | Optional absolute UART log path to probe before the job's default simulation directory |
+| `FIRESIM_QUEUE_HWDB_SNAPSHOT_ROOT` | Optional private directory for immutable hardware configuration snapshots |
+| `FIRESIM_QUEUE_KEEP_SLOT=1` | Keep large simulation inputs after a job finishes |
+
+## Commands
+
+```text
+firesim-queue submit [--priority N] [--project NAME] [--cwd PATH] [--background] -- COMMAND...
+firesim-queue runworkload-full --chipyard PATH --workload NAME [--bootbinary FILE]
+  [--stage-from ELF] [--hw-config KEY --hwdb-config-artifact FILE]
+  [--committed-file PATH SHA256 ...] [--consumed-slot DIR ELF_NAME ...]
+  [--hwdb-local-uri FIELD URI ARCHIVE_NAME ...]
+  [--timeout SECONDS] [--priority N] [--project NAME] [--background]
 firesim-queue status [--user USER] [--all]
-firesim-queue cancel <job_id> [--force]
-firesim-queue tail <job_id> [-f]
+firesim-queue cancel JOB_ID [--force] [--no-wait]
+firesim-queue tail JOB_ID [-f] [--uartlog]
 firesim-queue interactive [--window SECONDS]
 firesim-queue usage [--window SECONDS]
 firesim-queue daemon
 firesim-queue stop-daemon
 ```
 
-### Priority levels
-- `--priority 0`  — low (background work, courtesy to others)
-- `--priority 5`  — normal (default)
-- `--priority 10` — high (deadline-driven; jumps the queue but does NOT preempt)
+Priorities `0`, `5` (default), and `10` represent low, normal, and high.
+Within the highest waiting tier, the scheduler chooses the user served least
+recently, then the oldest submission. Running jobs are not preempted. Project
+names are inferred from the working directory or supplied with `--project`.
 
-### Project tag
-Auto-inferred from cwd: `/scratch2/<user>/<project>/...` → `<project>`.
-Override with `--project NAME` (useful for ad-hoc test invocations).
+Use `runworkload-full` when a job needs the whole FireSim lifecycle. The daemon
+stages the boot binary, runs a leading `firesim kill`, `infrasetup`,
+`runworkload`, and a trailing `kill` under one lock. It renders a per-job
+`config_runtime.yaml` and creates a private simulation directory. A positive
+`--timeout` bounds the workload phase; `0` leaves it unbounded. Leading and
+trailing kill and infrasetup have separate safety timeouts.
 
-## Scheduling rule (one rule, easy to debug)
+For a bitstream-specific run, pass `--hw-config`. With
+`--hwdb-config-artifact`, the queue hashes the supplied hardware database
+entry at submission, makes a daemon-owned private snapshot under the lock,
+and verifies that snapshot before each FireSim phase. This avoids races with a
+shared hardware database. Jobs without the artifact retain the legacy shared
+configuration behavior.
 
-1. Among `QUEUED` jobs, pick the highest `priority`.
-2. Within that tier, pick the user *not* served most recently (round-robin).
-3. Ties → oldest `submitted_at`.
+The optional exact-input handoff adds `--committed-file` for the staged ELF,
+bitstream archive, and driver archive; `--hwdb-local-uri` for the two exact
+archive URIs and their slot names; and `--consumed-slot` for each selected
+local simulation slot and its renamed ELF. All three option families, plus
+`--stage-from`, `--hw-config`, and `--hwdb-config-artifact`, are required
+together. Under the FPGA lock, the daemon verifies the selected hashes, takes
+private copies, and checks declared consumed slot bytes before the workload
+and after teardown. This opt-in path requires PyYAML. The adjacent
+`bin/pinned_files.py` helper is checked against its embedded SHA-256 before
+use. A caller's slot list does not prove that it includes every physical
+consumer; the FireSim integration must establish that correspondence.
 
-Daemon's choice is logged to `daemon.log` and reflected in `interactive`.
+A cancellation during `INFRASETUP` is deferred until flashing completes, then
+the job skips `runworkload` and performs teardown. Cancelling a running
+workload sends SIGTERM promptly. The infrasetup safety timeout still applies
+if flashing is wedged. Legacy `submit` jobs are opaque to the daemon; callers
+must manage their own FireSim cleanup.
 
-## Promoting to a global install
+Job output is in `$FIRESIM_QUEUE_ROOT/jobs/<id>/{stdout,stderr}.log`.
+`tail --uartlog -f` follows the simulator's UART log if it is readable.
+After a job finishes, the queue removes files of at least 8 MiB from its
+simulation slot and keeps smaller files. If a workload writes large results
+there, set `FIRESIM_QUEUE_KEEP_SLOT=1` on the daemon to preserve the full slot.
 
-When you're ready to make this a system-wide tool (any user, any path):
+## Development
 
-1. `sudo cp -r $FIRESIM_QUEUE_ROOT /opt/firesim-queue`
-2. `sudo chgrp -R <fpga-group> /opt/firesim-queue && sudo chmod -R g+rwX /opt/firesim-queue`
-3. `sudo ln -sf /opt/firesim-queue/bin/firesim-queue /usr/local/bin/firesim-queue`
-4. (Optional) Add a systemd unit so the daemon starts on boot:
-   ```ini
-   # /etc/systemd/system/firesim-queue.service
-   [Unit]
-   Description=FireSim job queue
-   After=network.target
-   [Service]
-   Type=simple
-   User=<fpga-group-member>
-   ExecStart=/opt/firesim-queue/bin/firesim-queue daemon
-   Restart=on-failure
-   [Install]
-   WantedBy=multi-user.target
-   ```
-5. Set `FIRESIM_QUEUE_ROOT=/opt/firesim-queue` in `/etc/profile.d/firesim-queue.sh`
-   so `firesim-queue` finds the shared queue.db.
-
-## Forcing all `firesim runworkload` calls through the queue
-
-Once you're comfortable with the explicit `FIRESIM_QUEUE=1` opt-in, you
-can transparently intercept *every* `firesim runworkload` by dropping a
-shim earlier on `$PATH` than the chipyard `firesim`:
+The implementation is in `bin/firesim_queue.py`; `bin/firesim-queue` is a
+launcher. Rich is optional. PyYAML is needed for the optional exact-input handoff;
+other queue commands use the Python standard library. The tests use temporary queue roots and a fake
+FireSim executable; they do not require an FPGA:
 
 ```bash
-# /usr/local/bin/firesim  (or wherever's earliest on PATH)
-#!/bin/bash
-# Resolve the user's real chipyard firesim — the next firesim on PATH
-# after this shim.
-real=$(which -a firesim 2>/dev/null | grep -v "$(readlink -f "$0")" | head -1)
-
-if [[ "$1" == "runworkload" ]]; then
-    exec /opt/firesim-queue/bin/firesim-queue submit \
-         --cwd "$PWD" -- "$real" "$@"
-else
-    exec "$real" "$@"
-fi
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-This is opt-in too — any user who doesn't want the queue just doesn't
-have `/usr/local/bin/firesim` shadowing their chipyard one.
-
-## Implementation notes
-
-- **SQLite WAL mode** for concurrent reader/writer between daemon and
-  multiple clients.
-- **flock on `fpga.lock`** held for the entire duration a job runs.
-  Even if a misbehaving caller bypasses the queue, the lock blocks
-  concurrent FPGA access.
-- **Daemon heartbeat** kv row updated every 30s. If clients see the
-  heartbeat is older than 5 min, they assume the daemon died and the
-  next submitter should restart it (`systemctl restart firesim-queue`
-  or `firesim-queue daemon &`).
-- **Crash safety:** jobs in `RUNNING` state with a stale daemon are
-  cleaned up on next daemon start (TODO — currently they just stay
-  `RUNNING` and confuse `status`).
-
-## Per-job stdout
-
-Every job's full stdout + stderr is at:
-```
-$FIRESIM_QUEUE_ROOT/jobs/<job_id>/{stdout,stderr}.log
-```
-
-Tail live with `firesim-queue tail <job_id> -f`.
-
-## Watching a running FireSim job (screen vs uartlog)
-
-When `firesim runworkload` is the job command, FireSim itself spawns a
-`screen` session (typically named `fsim0`, sometimes derived from the
-workload name — check `screen -ls`) to host the simulator. There are
-three ways to watch the live output, with different reach:
-
-| Method | Who can use it | Notes |
-|---|---|---|
-| `screen -r fsim0` | only the user who owns the daemon (= the user the screen socket lives under: `/run/screen/S-<daemon-user>/...`) | interactive, full terminal access to the simulator |
-| `sudo -u <daemon-user> screen -r fsim0` | any user with sudo to that account | same as above |
-| `firesim-queue tail <job_id> --uartlog -f` | **any user** with read perms on the FireSim results dir | non-interactive, but identical content to the screen session |
-
-The `--uartlog` mode finds the latest `results-workload/.../uartlog` under
-the job's cwd and tails it. Same UART bytes as the screen, just streamed
-through a regular file instead of a screen socket — works cross-user
-without sudo. Recommended for monitoring; reserve `screen -r` for cases
-where you actually need to interact with the simulator console.
-
-If you want to know which screen session FireSim spawned, run
-`screen -ls` as the daemon user — the name is printed there.
-
-## Removing it
-
-```
-firesim-queue stop-daemon
-# (then optionally rm -rf $FIRESIM_QUEUE_ROOT/ — keeps no
-#  user data outside that dir)
-```
+New integrations should use `runworkload-full` so setup, workload, and
+teardown share the same lock. Set host-specific environment variables on the
+daemon as well as on clients when the daemon needs them.
